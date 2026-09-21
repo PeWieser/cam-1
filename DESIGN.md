@@ -1,47 +1,29 @@
-# STICHEL Design- und Sicherheitsnotiz
+# Stichel – Designprotokoll
 
-## Produktgrenze
+## Ablauf (verbindlich)
+1. Modell laden (Drag & Drop / Datei) → 2. Oberseite wählen → 3. Schnittebene (Tiefe unter Oberkante, Konturen live)
+→ 4. Nullpunkt (3×3 + Z-Referenz, Pfeile auf der Bühne) → 5. Gravur (Strategie, Tiefe, Zustellung, Sicherheitshöhe)
+→ 6. Auswahl (Konturen per Klick auf der Bühne überspringen, „Außenkante überspringen“)
+→ 7. Werkzeug (Stichel in 3D über dem Nullpunkt) → 8. Berechnen (nur manuell; 3D-Weg + Simulation, 2D = Ansicht von oben)
+→ 9. Programm (Start/Ende, Presets GRBL/LinuxCNC/Marlin/minimal, Snippets) → 10. Export (Download, Kopieren, Strg+C).
 
-STICHEL erzeugt in dieser Version ausschließlich G-Code für geschlossene, aus einer horizontalen Schnittebene gewonnene Gravurkonturen mit einem Stichel. Taschen, Bohrungen, echte V-Carve-Flächenberechnung, Werkzeugradiuskorrektur, Kollisionsprüfung und maschinenspezifische Postprozessoren werden nicht behauptet oder simuliert.
+## Befund → Maßnahme
+- Schnitt bei 50 % Höhe erfasste bei „Würfel mit Zahl“ nur den Würfel. → Schnitt relativ zur Oberkante (Standard 0,1 mm), Konturen sofort sichtbar.
+- Automatische Neuberechnung bei jeder Eingabe. → Nur auf Knopfdruck; veraltete Ergebnisse werden als solche markiert.
+- G-Code: modale Zeilen ohne G-Wort, erster Verfahrweg ohne garantierte Sicherheitshöhe. → Explizites G0/G1 je Zeile, `G0 Z{safe}` immer als erste Bewegung.
+- Export ≠ Bühne. → G-Code und 3D-Weg entstehen aus derselben Move-Liste.
+- Kein Undo. → Zustandsbasiertes Undo/Redo (Strg+Z / Strg+Shift+Z) für alle Einstellungen inkl. Auswahl.
+- Frontplatte freistellen/Tasche. → `pathSide` on|outside|inside mit Schaft-Ø/2-Offset.
+- Rückseitengravur. → `mirrorY`.
+- Presets nur Klick. → Chips drag & drop in Start/Ende-Felder, morphen zu Code.
+- G-Code unsichtbar. → Export-Schritt: Code-Pane rechts neben der Bühne mit Syntaxfarben.
+- „Außenkante“ unklar bei Inseln. → Größte Kontur + „Nur Features“.
 
-## Verbindlicher Ablauf
+Siehe TESTMATRIX.md für alle Frontplatten-Szenarien.
 
-1. Modell lokal öffnen: STL, OBJ, 3MF oder PLY.
-2. Oberseite über eine von sechs Achsenrichtungen festlegen.
-3. Horizontale Schnittebene knapp unter die relevante Geometrie legen.
-4. Werkstück-Nullpunkt als Ecke oder Mittelpunkt festlegen; Z0 liegt auf der Oberfläche.
-5. Stichel, Tiefe, Zustellung, Sicherheits-Z, Vorschübe und Drehzahl prüfen.
-6. Erkannte Konturen direkt in der Draufsicht aktivieren oder ignorieren.
-7. 2D- oder 3D-Bewegung ausdrücklich berechnen, Start-/Endschritte ordnen, prüfen und exportieren.
+## Tokens
+Farben ausschließlich über `--mw-*` (light-dark). Ausnahme: Three.js-Canvas (`C` in Stage.tsx, dokumentiert).
+Geist Sans für Text, Geist Mono + tabular-nums (`.num`) für alle Zahlen. Akzent nur für aktiv/Fokus/primäre Aktion.
 
-Kein Werkzeugweg und kein G-Code wird automatisch erzeugt. Jede Änderung nach einer Berechnung verwirft das Ergebnis.
-
-## G-Code-Regeln
-
-- Millimeter, absolut, XY-Ebene, Vorschub pro Minute: `G21 G90 G17 G94`.
-- Keine unbekannte Bewegung in Maschinenkoordinaten und insbesondere kein fest verdrahtetes `G53`.
-- XY-Eilgang erfolgt nur auf positivem Sicherheits-Z.
-- Eintauchen erfolgt mit separatem Plunge-Vorschub.
-- Jede Kontur endet mit Rückzug auf Sicherheits-Z.
-- Standardende: Rückzug, `M5`, `M30`.
-- Ungültige Reihenfolgen wie Endschritt vor Bewegung werden abgewiesen.
-
-## Interaktion
-
-- Eine Funktion hat genau einen sichtbaren Ort im siebenstufigen Ablauf.
-- Konturen werden direkt in der 2D-Bühne gewählt; die Liste rechts spiegelt denselben Zustand.
-- `Escape` beendet den aktuellen Fehler-/Moduszustand.
-- `Strg/Cmd+Z` und `Strg/Cmd+Y` steuern Undo/Redo für Projekteinstellungen.
-- `Strg/Cmd+C` kopiert den G-Code nur im berechneten Zustand und nur, wenn kein Text markiert ist.
-- Alle Berechnungsparameter verwenden Geist Mono und tabellarische Ziffern.
-
-## Visuelles System
-
-- Geist Sans für Sprache, Geist Mono für Messwerte.
-- Eine Akzentfarbe: Blau bedeutet Auswahl, Fokus oder primäre Aktion.
-- Oberflächen verwenden `--mw-surface-*`, Kanten `--mw-border`; Komponenten enthalten keine eigenen UI-Farbwerte. Canvas-Farben sind dokumentierte Ausnahme.
-- Übergänge dauern 160 bis 180 ms, ohne Bounce oder Dauereffekt.
-
-## Offene Produktionsanforderungen
-
-Vor realer Maschinenfreigabe fehlen weiterhin maschinenspezifischer Postprozessor, Halter-/Spannmittel-Kollisionen, Material- und Werkzeugdatenbank sowie ein unabhängiger G-Code-Simulator. Exportierter Code muss deshalb extern simuliert und an der Maschine im Trockenlauf geprüft werden.
+## Tastatur
+Strg+Z / Strg+Shift+Z Undo/Redo · Alt+←/→ Schritt · Esc stoppt Simulation · Strg+C im Export kopiert G-Code.
