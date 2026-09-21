@@ -1,72 +1,102 @@
-import type { CamSettings, ToolpathResult } from '../types';
+import type { Contour, MotionMode, Point2D, SequenceStep, ToolSettings, ToolpathPass, ToolpathResult } from "../types/cam";
 
-const fmt = (n: number) => {
-  const r = Math.round(n * 1000) / 1000;
-  return Object.is(r, -0) ? '0' : String(r);
-};
-
-export function generateGcode(result: ToolpathResult, s: CamSettings, fileName: string): string {
-  const L: string[] = [];
-  const now = new Date().toISOString().slice(0, 16).replace('T', ' ');
-  const zSafe = s.safeZ + (s.originZ === 'bottom-of-cut' ? s.totalDepth : 0);
-
-  L.push(`; Gravur-G-Code – erzeugt von Stichel CAM`);
-  L.push(`; Quelle: ${fileName}`);
-  L.push(`; Datum: ${now}`);
-  L.push(`; Strategie: ${s.strategy === 'contour' ? 'Kontur' : s.strategy === 'centerline' ? 'Mittellinie' : 'Flaechenfuellung'}`);
-  L.push(`; Werkzeug: Stichel, Spitze ~${fmt(s.toolDia)} mm`);
-  L.push(`; Tiefe: ${fmt(s.totalDepth)} mm in ${result.stats.passCount} Zustellung(en) je ${fmt(s.stepDown)} mm`);
-  L.push(`; Kurventoleranz: ${fmt(s.tolerance)} mm`);
-  L.push(`; Nullpunkt XY: ${s.originXY} | Z: ${s.originZ === 'top' ? 'Werkstueckoberflaeche' : 'Gravurgrund'}`);
-  if (result.bounds) {
-    L.push(`; Arbeitsbereich: X ${fmt(result.bounds.minX)}..${fmt(result.bounds.maxX)}  Y ${fmt(result.bounds.minY)}..${fmt(result.bounds.maxY)} mm`);
-  }
-  L.push(`; Fraeslaenge: ${fmt(result.stats.cutLength)} mm | geschaetzte Zeit: ${fmt(result.stats.timeMin)} min`);
-  L.push('');
-  L.push('G21 ; Millimeter');
-  L.push('G90 ; Absolute Koordinaten');
-  L.push('G17 ; XY-Ebene');
-  L.push('G94 ; Vorschub mm/min');
-  if (s.useSpindleCmd) L.push(`M3 S${Math.round(s.spindleRpm)} ; Spindel ein`);
-  L.push(`G0 Z${fmt(zSafe)} ; Sicherheitshoehe`);
-  L.push('');
-
-  let lastX = NaN, lastY = NaN, lastZ = NaN, lastF = NaN;
-  const g0 = (x?: number, y?: number, z?: number) => {
-    const parts: string[] = ['G0'];
-    if (x !== undefined && x !== lastX) { parts.push(`X${fmt(x)}`); lastX = x; }
-    if (y !== undefined && y !== lastY) { parts.push(`Y${fmt(y)}`); lastY = y; }
-    if (z !== undefined && z !== lastZ) { parts.push(`Z${fmt(z)}`); lastZ = z; }
-    if (parts.length > 1) L.push(parts.join(' '));
-  };
-  const g1 = (x: number | undefined, y: number | undefined, z: number | undefined, f: number) => {
-    const parts: string[] = ['G1'];
-    if (x !== undefined && x !== lastX) { parts.push(`X${fmt(x)}`); lastX = x; }
-    if (y !== undefined && y !== lastY) { parts.push(`Y${fmt(y)}`); lastY = y; }
-    if (z !== undefined && z !== lastZ) { parts.push(`Z${fmt(z)}`); lastZ = z; }
-    if (parts.length === 1) return;
-    if (f !== lastF) { parts.push(`F${fmt(f)}`); lastF = f; }
-    L.push(parts.join(' '));
-  };
-
-  let pathNo = 0;
-  for (const pass of result.passes) {
-    pathNo++;
-    const first = pass.pts[0];
-    L.push(`; Pfad ${pathNo} @ Z${fmt(pass.z)}`);
-    g0(undefined, undefined, zSafe);
-    g0(first.x, first.y, undefined);
-    g1(undefined, undefined, pass.z, s.feedZ);
-    for (let i = 1; i < pass.pts.length; i++) {
-      g1(pass.pts[i].x, pass.pts[i].y, undefined, s.feedXY);
-    }
-    if (pass.closed) g1(first.x, first.y, undefined, s.feedXY);
-  }
-
-  L.push('');
-  L.push(`G0 Z${fmt(zSafe)} ; abheben`);
-  if (s.useSpindleCmd) L.push('M5 ; Spindel aus');
-  L.push('G0 X0 Y0 ; zurueck zum Nullpunkt');
-  L.push('M30 ; Programmende');
-  return L.join('\n');
+interface GenerateInput {
+  contours: Contour[];
+  ignoredIds: string[];
+  origin: Point2D;
+  tool: ToolSettings;
+  mode: MotionMode;
+  sequence: SequenceStep[];
+  fileName: string;
 }
+
+export function generateToolpath(input: GenerateInput): ToolpathResult {
+  const selected = input.contours.filter((contour) => !input.ignoredIds.includes(contour.id));
+  if (!selected.length) throw new Error("Mindestens eine Kontur muss für die Bearbeitung aktiv bleiben.");
+  validateTool(input.tool);
+
+  const depths = input.mode === "2d"
+    ? [-input.tool.depth]
+    : depthPasses(input.tool.depth, input.tool.stepDown);
+  const passes: ToolpathPass[] = [];
+  for (const depth of depths) {
+    for (const contour of selected) {
+      passes.push({
+        contourId: contour.id,
+        depth,
+        points: contour.points.map((point) => ({ x: point.x - input.origin.x, y: point.y - input.origin.y, z: depth })),
+      });
+    }
+  }
+
+  const lines: string[] = [
+    `(Stichel CAM: ${sanitize(input.fileName)})`,
+    `(V-Bit ${fmt(input.tool.angle)} deg, Spitze ${fmt(input.tool.diameter)} mm)`,
+  ];
+  const hasStart = input.sequence.some((step) => step.preset === "safe-start");
+  const hasEnd = input.sequence.some((step) => step.preset === "safe-end");
+  const warnings: string[] = [];
+  if (!hasStart) throw new Error("Füge den Preset-Schritt Sicher starten hinzu.");
+  if (!hasEnd) throw new Error("Füge den Preset-Schritt Sicher beenden hinzu.");
+  const movementIndex = input.sequence.findIndex((step) => step.preset === "movement");
+  const startIndices = input.sequence.map((step, index) => step.preset === "safe-start" ? index : -1).filter((index) => index >= 0);
+  const endIndices = input.sequence.map((step, index) => step.preset === "safe-end" ? index : -1).filter((index) => index >= 0);
+  if (startIndices.length > 1 || endIndices.length > 1) throw new Error("Sicher starten und Sicher beenden dürfen jeweils nur einmal vorkommen.");
+  if (hasStart && startIndices[0] > movementIndex) throw new Error("Sicher starten muss vor der berechneten Bewegung liegen.");
+  if (hasEnd && endIndices[0] < movementIndex) throw new Error("Sicher beenden muss nach der berechneten Bewegung liegen.");
+
+  if (movementIndex < 0) throw new Error("Die berechnete Bewegung fehlt in der Schrittfolge.");
+  let cutLength = 0;
+  for (const step of input.sequence) {
+    if (step.preset !== "movement") {
+      emitSequence(lines, [step], input.tool);
+      continue;
+    }
+    for (const pass of passes) {
+      const first = pass.points[0];
+      lines.push(`(Kontur ${pass.contourId}, Z${fmt(pass.depth)})`);
+      lines.push(`G0 Z${fmt(input.tool.safeZ)}`);
+      lines.push(`G0 X${fmt(first.x)} Y${fmt(first.y)}`);
+      lines.push(`G1 Z${fmt(pass.depth)} F${fmt(input.tool.plungeRate)}`);
+      lines.push(`F${fmt(input.tool.feedRate)}`);
+      for (let index = 1; index < pass.points.length; index += 1) {
+        const point = pass.points[index];
+        const previous = pass.points[index - 1];
+        cutLength += Math.hypot(point.x - previous.x, point.y - previous.y);
+        lines.push(`G1 X${fmt(point.x)} Y${fmt(point.y)}`);
+      }
+      lines.push(`G0 Z${fmt(input.tool.safeZ)}`);
+    }
+  }
+  const estimatedSeconds = cutLength / input.tool.feedRate * 60 + passes.length * (input.tool.safeZ + input.tool.depth) / input.tool.plungeRate * 60 + 2;
+  return { passes, gcode: lines.join("\n"), warnings, cutLength, estimatedSeconds, generatedAt: Date.now() };
+}
+
+function emitSequence(lines: string[], sequence: SequenceStep[], tool: ToolSettings) {
+  for (const step of sequence) {
+    if (step.preset === "safe-start") lines.push("G21 G90 G17 G94", `G0 Z${fmt(tool.safeZ)}`, `M3 S${Math.round(tool.spindleRpm)}`, "G4 P2");
+    if (step.preset === "movement") continue;
+    if (step.preset === "pause") lines.push("M0 (Pause)");
+    if (step.preset === "return-origin") lines.push(`G0 Z${fmt(tool.safeZ)}`, "G0 X0 Y0");
+    if (step.preset === "safe-end") lines.push(`G0 Z${fmt(tool.safeZ)}`, "M5", "M30");
+  }
+}
+
+function depthPasses(depth: number, stepDown: number) {
+  const result: number[] = [];
+  for (let current = stepDown; current < depth - 1e-9; current += stepDown) result.push(-current);
+  result.push(-depth);
+  return result;
+}
+
+function validateTool(tool: ToolSettings) {
+  if (tool.diameter <= 0 || tool.diameter > 20) throw new Error("Die Spitzenbreite muss zwischen 0 und 20 mm liegen.");
+  if (tool.angle < 10 || tool.angle >= 180) throw new Error("Der Spitzenwinkel muss zwischen 10 und 179 Grad liegen.");
+  if (tool.depth <= 0 || tool.depth > 20) throw new Error("Die Tiefe muss zwischen 0 und 20 mm liegen.");
+  if (tool.stepDown <= 0 || tool.stepDown > tool.depth) throw new Error("Die Zustellung muss größer als 0 und höchstens so groß wie die Tiefe sein.");
+  if (tool.safeZ <= 0) throw new Error("Sicherheits-Z muss über der Oberfläche liegen.");
+  if (tool.feedRate <= 0 || tool.plungeRate <= 0 || tool.spindleRpm <= 0) throw new Error("Vorschub, Eintauchen und Drehzahl müssen größer als 0 sein.");
+}
+
+function sanitize(value: string) { return value.replace(/[()]/g, "").slice(0, 80); }
+function fmt(value: number) { return value.toFixed(3).replace(/\.000$/, ""); }

@@ -1,240 +1,144 @@
-import type { Contour, Vec2 } from '../types';
+import type { Bounds3D, Contour, Orientation, Point2D, TriangleMesh } from "../types/cam";
 
-// ---------------------------------------------------------------------------
-// Mesh-Slicing: Schnitt aller Dreiecke mit der Ebene z = zSlice
-// ---------------------------------------------------------------------------
+export function orientMesh(source: TriangleMesh, orientation: Orientation): { mesh: TriangleMesh; bbox: Bounds3D } {
+  const output = new Float32Array(source.positions.length);
+  const map = (x: number, y: number, z: number): [number, number, number] => {
+    if (orientation === "-Z") return [x, -y, -z];
+    if (orientation === "+X") return [y, z, x];
+    if (orientation === "-X") return [-y, z, -x];
+    if (orientation === "+Y") return [x, -z, y];
+    if (orientation === "-Y") return [x, z, -y];
+    return [x, y, z];
+  };
 
-type Seg = { a: Vec2; b: Vec2 };
-
-export function sliceMesh(positions: Float32Array, zSlice: number): Seg[] {
-  const segs: Seg[] = [];
-  const n = positions.length;
-  for (let i = 0; i < n; i += 9) {
-    const z0 = positions[i + 2], z1 = positions[i + 5], z2 = positions[i + 8];
-    const min = Math.min(z0, z1, z2), max = Math.max(z0, z1, z2);
-    if (zSlice < min || zSlice > max || min === max) continue;
-
-    const pts: Vec2[] = [];
-    const edge = (ax: number, ay: number, az: number, bx: number, by: number, bz: number) => {
-      if ((az < zSlice && bz >= zSlice) || (bz < zSlice && az >= zSlice)) {
-        const t = (zSlice - az) / (bz - az);
-        pts.push({ x: ax + t * (bx - ax), y: ay + t * (by - ay) });
-      }
-    };
-    edge(positions[i], positions[i + 1], z0, positions[i + 3], positions[i + 4], z1);
-    edge(positions[i + 3], positions[i + 4], z1, positions[i + 6], positions[i + 7], z2);
-    edge(positions[i + 6], positions[i + 7], z2, positions[i], positions[i + 1], z0);
-
-    if (pts.length === 2) {
-      const dx = pts[0].x - pts[1].x, dy = pts[0].y - pts[1].y;
-      if (dx * dx + dy * dy > 1e-14) segs.push({ a: pts[0], b: pts[1] });
-    }
+  const raw: number[] = [];
+  for (let index = 0; index < source.positions.length; index += 3) {
+    raw.push(...map(source.positions[index], source.positions[index + 1], source.positions[index + 2]));
   }
-  return segs;
+  const rawBounds = boundsOf(new Float32Array(raw));
+  for (let index = 0; index < raw.length; index += 3) {
+    output[index] = raw[index] - rawBounds.min[0];
+    output[index + 1] = raw[index + 1] - rawBounds.min[1];
+    output[index + 2] = raw[index + 2] - rawBounds.max[2];
+  }
+  return { mesh: { positions: output }, bbox: boundsOf(output) };
 }
 
-// ---------------------------------------------------------------------------
-// Segmente zu Konturen verketten (Hash über gerundete Endpunkte)
-// ---------------------------------------------------------------------------
-
-export function chainSegments(segs: Seg[], eps = 1e-3): { pts: Vec2[]; closed: boolean }[] {
-  const key = (p: Vec2) => `${Math.round(p.x / eps)},${Math.round(p.y / eps)}`;
-  const map = new Map<string, number[]>();
-  segs.forEach((s, i) => {
-    for (const p of [s.a, s.b]) {
-      const k = key(p);
-      const arr = map.get(k);
-      if (arr) arr.push(i); else map.set(k, [i]);
+export function extractContours(mesh: TriangleMesh, depthFromTop: number, tolerance: number): Contour[] {
+  const z = -Math.max(0.001, depthFromTop);
+  const segments: [Point2D, Point2D][] = [];
+  const p = mesh.positions;
+  for (let index = 0; index < p.length; index += 9) {
+    const vertices = [
+      { x: p[index], y: p[index + 1], z: p[index + 2] },
+      { x: p[index + 3], y: p[index + 4], z: p[index + 5] },
+      { x: p[index + 6], y: p[index + 7], z: p[index + 8] },
+    ];
+    const intersections: Point2D[] = [];
+    for (let edge = 0; edge < 3; edge += 1) {
+      const a = vertices[edge];
+      const b = vertices[(edge + 1) % 3];
+      const da = a.z - z;
+      const db = b.z - z;
+      if (Math.abs(da) < 1e-7 && Math.abs(db) < 1e-7) continue;
+      if ((da > 0) === (db > 0) && Math.abs(da) > 1e-7 && Math.abs(db) > 1e-7) continue;
+      const denominator = b.z - a.z;
+      if (Math.abs(denominator) < 1e-9) continue;
+      const t = (z - a.z) / denominator;
+      if (t >= -1e-7 && t <= 1 + 1e-7) intersections.push({ x: a.x + t * (b.x - a.x), y: a.y + t * (b.y - a.y) });
     }
+    const unique = dedupe(intersections, 1e-5);
+    if (unique.length === 2 && distance(unique[0], unique[1]) > 1e-6) segments.push([unique[0], unique[1]]);
+  }
+
+  return chainSegments(segments, Math.max(0.001, tolerance * 0.25))
+    .filter((points) => points.length >= 4 && distance(points[0], points[points.length - 1]) <= Math.max(0.02, tolerance))
+    .map((points) => simplify(close(points), tolerance))
+    .map((points, index) => ({
+      id: `contour-${index}`,
+      points,
+      area: Math.abs(signedArea(points)),
+      perimeter: perimeter(points),
+      ignored: false,
+    }))
+    .filter((contour) => contour.area > tolerance * tolerance && contour.perimeter > tolerance * 4)
+    .sort((a, b) => b.area - a.area);
+}
+
+export function originFor(contours: Contour[], preset: string): Point2D {
+  const points = contours.flatMap((contour) => contour.points);
+  if (!points.length) return { x: 0, y: 0 };
+  const minX = Math.min(...points.map((point) => point.x));
+  const maxX = Math.max(...points.map((point) => point.x));
+  const minY = Math.min(...points.map((point) => point.y));
+  const maxY = Math.max(...points.map((point) => point.y));
+  if (preset === "top-left") return { x: minX, y: maxY };
+  if (preset === "top-right") return { x: maxX, y: maxY };
+  if (preset === "bottom-right") return { x: maxX, y: minY };
+  if (preset === "center") return { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
+  return { x: minX, y: minY };
+}
+
+function chainSegments(input: [Point2D, Point2D][], epsilon: number): Point2D[][] {
+  const segments = input.slice();
+  const chains: Point2D[][] = [];
+  while (segments.length) {
+    const first = segments.pop()!;
+    const chain = [first[0], first[1]];
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (let index = segments.length - 1; index >= 0; index -= 1) {
+        const [a, b] = segments[index];
+        const head = chain[0];
+        const tail = chain[chain.length - 1];
+        if (distance(tail, a) <= epsilon) chain.push(b);
+        else if (distance(tail, b) <= epsilon) chain.push(a);
+        else if (distance(head, b) <= epsilon) chain.unshift(a);
+        else if (distance(head, a) <= epsilon) chain.unshift(b);
+        else continue;
+        segments.splice(index, 1);
+        changed = true;
+        break;
+      }
+    }
+    chains.push(chain);
+  }
+  return chains;
+}
+
+function simplify(points: Point2D[], tolerance: number): Point2D[] {
+  if (points.length < 4) return points;
+  const open = points.slice(0, -1);
+  const kept = open.filter((point, index) => {
+    if (index === 0) return true;
+    const previous = open[(index - 1 + open.length) % open.length];
+    return distance(point, previous) >= tolerance;
   });
-
-  const used = new Array(segs.length).fill(false);
-  const out: { pts: Vec2[]; closed: boolean }[] = [];
-
-  for (let i = 0; i < segs.length; i++) {
-    if (used[i]) continue;
-    used[i] = true;
-    const chain: Vec2[] = [segs[i].a, segs[i].b];
-
-    // in beide Richtungen erweitern
-    for (const dir of [1, -1] as const) {
-      let cur = dir === 1 ? chain[chain.length - 1] : chain[0];
-      let guard = segs.length + 2;
-      while (guard-- > 0) {
-        const cands = map.get(key(cur)) || [];
-        let next = -1;
-        for (const c of cands) if (!used[c]) { next = c; break; }
-        if (next < 0) break;
-        used[next] = true;
-        const s = segs[next];
-        const nextPt = key(s.a) === key(cur) ? s.b : s.a;
-        if (dir === 1) chain.push(nextPt); else chain.unshift(nextPt);
-        cur = nextPt;
-      }
-    }
-
-    const first = chain[0], last = chain[chain.length - 1];
-    const closed = key(first) === key(last);
-    if (closed) chain.pop();
-    if (chain.length >= (closed ? 3 : 2)) out.push({ pts: chain, closed });
-  }
-  return out;
+  return close(kept.length >= 3 ? kept : open);
 }
 
-// ---------------------------------------------------------------------------
-// Douglas-Peucker-Vereinfachung (Kurventoleranz)
-// ---------------------------------------------------------------------------
-
-export function simplify(pts: Vec2[], tol: number, closed: boolean): Vec2[] {
-  if (tol <= 0 || pts.length < 3) return pts;
-  const work = closed ? [...pts, pts[0]] : pts;
-  const keep = new Array(work.length).fill(false);
-  keep[0] = keep[work.length - 1] = true;
-  const stack: [number, number][] = [[0, work.length - 1]];
-  while (stack.length) {
-    const [s, e] = stack.pop()!;
-    if (e - s < 2) continue;
-    const ax = work[s].x, ay = work[s].y, bx = work[e].x, by = work[e].y;
-    const dx = bx - ax, dy = by - ay;
-    const len2 = dx * dx + dy * dy;
-    let maxD = -1, maxI = -1;
-    for (let i = s + 1; i < e; i++) {
-      let d: number;
-      if (len2 < 1e-12) {
-        d = Math.hypot(work[i].x - ax, work[i].y - ay);
-      } else {
-        d = Math.abs(dy * work[i].x - dx * work[i].y + bx * ay - by * ax) / Math.sqrt(len2);
-      }
-      if (d > maxD) { maxD = d; maxI = i; }
-    }
-    if (maxD > tol) {
-      keep[maxI] = true;
-      stack.push([s, maxI], [maxI, e]);
-    }
-  }
-  const res = work.filter((_, i) => keep[i]);
-  if (closed) res.pop();
-  return res.length >= (closed ? 3 : 2) ? res : pts;
+function close(points: Point2D[]) {
+  if (!points.length) return points;
+  return distance(points[0], points[points.length - 1]) < 1e-6 ? points : [...points, points[0]];
 }
 
-// ---------------------------------------------------------------------------
-// Polygon-Hilfen
-// ---------------------------------------------------------------------------
-
-export function signedArea(pts: Vec2[]): number {
-  let a = 0;
-  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
-    a += (pts[j].x + pts[i].x) * (pts[j].y - pts[i].y);
-  }
-  return a / 2;
+function dedupe(points: Point2D[], epsilon: number) {
+  return points.filter((point, index) => points.findIndex((other) => distance(point, other) < epsilon) === index);
 }
 
-export function pathLength(pts: Vec2[], closed: boolean): number {
-  let l = 0;
-  for (let i = 1; i < pts.length; i++) l += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
-  if (closed && pts.length > 1) {
-    l += Math.hypot(pts[0].x - pts[pts.length - 1].x, pts[0].y - pts[pts.length - 1].y);
-  }
-  return l;
-}
+function distance(a: Point2D, b: Point2D) { return Math.hypot(a.x - b.x, a.y - b.y); }
+function perimeter(points: Point2D[]) { return points.slice(1).reduce((sum, point, index) => sum + distance(points[index], point), 0); }
+function signedArea(points: Point2D[]) { return points.slice(1).reduce((sum, point, index) => sum + points[index].x * point.y - point.x * points[index].y, 0) / 2; }
 
-export function pointInPolygon(p: Vec2, poly: Vec2[]): boolean {
-  let inside = false;
-  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-    const xi = poly[i].x, yi = poly[i].y, xj = poly[j].x, yj = poly[j].y;
-    if ((yi > p.y) !== (yj > p.y) && p.x < ((xj - xi) * (p.y - yi)) / (yj - yi) + xi) {
-      inside = !inside;
+function boundsOf(positions: Float32Array): Bounds3D {
+  const min: [number, number, number] = [Infinity, Infinity, Infinity];
+  const max: [number, number, number] = [-Infinity, -Infinity, -Infinity];
+  for (let index = 0; index < positions.length; index += 3) {
+    for (let axis = 0; axis < 3; axis += 1) {
+      min[axis] = Math.min(min[axis], positions[index + axis]);
+      max[axis] = Math.max(max[axis], positions[index + axis]);
     }
   }
-  return inside;
-}
-
-/** Verschachtelungstiefe aller geschlossenen Konturen bestimmen */
-export function buildContours(
-  chains: { pts: Vec2[]; closed: boolean }[],
-  tol: number
-): Contour[] {
-  const simplified = chains.map((c) => ({ pts: simplify(c.pts, tol, c.closed), closed: c.closed }));
-  const closedIdx = simplified.map((c, i) => (c.closed ? i : -1)).filter((i) => i >= 0);
-
-  const contours: Contour[] = simplified.map((c) => ({
-    pts: c.pts,
-    closed: c.closed,
-    area: c.closed ? Math.abs(signedArea(c.pts)) : 0,
-    length: pathLength(c.pts, c.closed),
-    depth: 0,
-    isOuter: true,
-  }));
-
-  // Verschachtelung: wie viele andere geschlossene Konturen enthalten mich?
-  for (const i of closedIdx) {
-    const p = contours[i].pts[0];
-    let d = 0;
-    for (const j of closedIdx) {
-      if (i === j) continue;
-      if (contours[j].area <= contours[i].area) continue;
-      if (pointInPolygon(p, contours[j].pts)) d++;
-    }
-    contours[i].depth = d;
-    contours[i].isOuter = d % 2 === 0;
-  }
-  return contours;
-}
-
-// ---------------------------------------------------------------------------
-// Schraffur-Füllung (Scanlines, Even-Odd, Serpentinen-Ordnung)
-// ---------------------------------------------------------------------------
-
-export function hatchFill(
-  contours: Contour[],
-  stepOver: number,
-  angleDeg: number
-): Vec2[][] {
-  const closed = contours.filter((c) => c.closed && c.pts.length >= 3);
-  if (!closed.length || stepOver <= 0) return [];
-
-  const ang = (angleDeg * Math.PI) / 180;
-  const cos = Math.cos(-ang), sin = Math.sin(-ang);
-  const rot = (p: Vec2): Vec2 => ({ x: p.x * cos - p.y * sin, y: p.x * sin + p.y * cos });
-  const unrot = (p: Vec2): Vec2 => ({
-    x: p.x * Math.cos(ang) - p.y * Math.sin(ang),
-    y: p.x * Math.sin(ang) + p.y * Math.cos(ang),
-  });
-
-  const polys = closed.map((c) => c.pts.map(rot));
-  let minY = Infinity, maxY = -Infinity, minX = Infinity, maxX = -Infinity;
-  for (const poly of polys) for (const p of poly) {
-    if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
-    if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
-  }
-
-  const lines: Vec2[][] = [];
-  let flip = false;
-  const maxLines = 5000;
-  let count = 0;
-  for (let y = minY + stepOver / 2; y < maxY; y += stepOver) {
-    if (count++ > maxLines) break;
-    const xs: number[] = [];
-    for (const poly of polys) {
-      for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-        const a = poly[j], b = poly[i];
-        if ((a.y > y) !== (b.y > y)) {
-          xs.push(a.x + ((y - a.y) / (b.y - a.y)) * (b.x - a.x));
-        }
-      }
-    }
-    xs.sort((a, b) => a - b);
-    const rowSegs: Vec2[][] = [];
-    for (let k = 0; k + 1 < xs.length; k += 2) {
-      if (xs[k + 1] - xs[k] < 1e-6) continue;
-      rowSegs.push([unrot({ x: xs[k], y }), unrot({ x: xs[k + 1], y })]);
-    }
-    if (flip) rowSegs.reverse();
-    for (const s of rowSegs) {
-      if (flip) s.reverse();
-      lines.push(s);
-    }
-    flip = !flip;
-  }
-  return lines;
+  return { min, max };
 }

@@ -1,342 +1,135 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { CamSettings, MeshData, ToolpathResult } from './types';
-import { defaultSettings } from './types';
-import { loadModelFile, SUPPORTED_EXT } from './lib/loaders';
-import { computeToolpaths } from './lib/toolpath';
-import { generateGcode } from './lib/gcode';
-import Viewer3D from './components/Viewer3D';
-import Preview2D from './components/Preview2D';
-import { NumberField, OriginPicker, Section, Segmented, SliderField, Toggle } from './components/controls';
-import { cn } from './utils/cn';
+import { useEffect, useMemo, useState } from "react";
+import { ArrowLeft, ArrowRight, Check, ChevronDown, ChevronUp, Clipboard, Download, Eye, EyeOff, FileBox, Plus, Redo2, Trash2, Undo2 } from "lucide-react";
+import { ContourCanvas } from "./components/ContourCanvas";
+import { FileUpload } from "./components/FileUpload";
+import { ModelViewer } from "./components/ModelViewer";
+import { extractContours, orientMesh, originFor } from "./lib/geometry";
+import { generateToolpath } from "./lib/gcode";
+import { loadModel } from "./lib/modelLoader";
+import { DEFAULT_PROJECT, type ModelInfo, type MotionMode, type Orientation, type OriginPreset, type ProjectState, type SequencePreset, type ToolpathResult } from "./types/cam";
 
-type Tab = '3d' | '2d' | 'gcode';
+const STEPS = ["Modell", "Oberseite", "Abschnitt", "Nullpunkt", "Werkzeug", "Konturen", "Bewegung"];
+const ORIENTATIONS: { value: Orientation; label: string; hint: string }[] = [
+  { value: "+Z", label: "+Z", hint: "Aktuelle Oberseite" }, { value: "-Z", label: "-Z", hint: "Unterseite" },
+  { value: "+X", label: "+X", hint: "Rechte Seite" }, { value: "-X", label: "-X", hint: "Linke Seite" },
+  { value: "+Y", label: "+Y", hint: "Rückseite" }, { value: "-Y", label: "-Y", hint: "Vorderseite" },
+];
 
 export default function App() {
-  const [mesh, setMesh] = useState<MeshData | null>(null);
-  const [settings, setSettings] = useState<CamSettings>(defaultSettings);
-  const [result, setResult] = useState<ToolpathResult | null>(null);
-  const [tab, setTab] = useState<Tab>('3d');
+  const [model, setModel] = useState<ModelInfo | null>(null);
+  const [project, setProject] = useState<ProjectState>(DEFAULT_PROJECT);
+  const [past, setPast] = useState<ProjectState[]>([]);
+  const [future, setFuture] = useState<ProjectState[]>([]);
+  const [step, setStep] = useState(0);
   const [loading, setLoading] = useState(false);
-  const [computing, setComputing] = useState(false);
+  const [result, setResult] = useState<ToolpathResult | null>(null);
+  const [status, setStatus] = useState("Modell öffnen, um zu beginnen.");
   const [error, setError] = useState<string | null>(null);
-  const [dragOver, setDragOver] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [showTool, setShowTool] = useState(true);
 
-  const set = useCallback(<K extends keyof CamSettings>(key: K, value: CamSettings[K]) => {
-    setSettings((s) => ({ ...s, [key]: value }));
-  }, []);
+  const oriented = useMemo(() => model ? orientMesh(model.mesh, project.orientation) : null, [model, project.orientation]);
+  const modelHeight = oriented ? Math.abs(oriented.bbox.min[2]) : 1;
+  const sectionDepth = Math.min(Math.max(project.sectionDepth, 0.001), Math.max(modelHeight - 0.001, 0.001));
+  const contours = useMemo(() => oriented ? extractContours(oriented.mesh, sectionDepth, project.tool.tolerance) : [], [oriented, sectionDepth, project.tool.tolerance]);
+  const origin = useMemo(() => originFor(contours, project.originPreset), [contours, project.originPreset]);
+  const activeContours = contours.filter((contour) => !project.ignoredContourIds.includes(contour.id));
 
-  // Datei laden
-  const handleFile = useCallback(async (file: File) => {
-    setError(null);
-    setLoading(true);
-    try {
-      const m = await loadModelFile(file);
-      setMesh(m);
-      setTab('2d');
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Datei konnte nicht gelesen werden.');
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  const commit = (next: ProjectState, message = "Einstellung gespeichert.") => {
+    setPast((items) => [...items.slice(-49), project]); setFuture([]); setProject(next);
+    setStatus(result ? "Einstellung geändert. Bewegung bitte neu berechnen." : message); setResult(null); setError(null);
+  };
+  const patch = (value: Partial<ProjectState>, message?: string) => commit({ ...project, ...value }, message);
+  const patchTool = (key: keyof ProjectState["tool"], value: number) => commit({ ...project, tool: { ...project.tool, [key]: value } });
+  const undo = () => { const previous = past.at(-1); if (!previous) return; setFuture((items) => [project, ...items]); setPast((items) => items.slice(0, -1)); setProject(previous); setResult(null); setStatus("Rückgängig gemacht."); };
+  const redo = () => { const next = future[0]; if (!next) return; setPast((items) => [...items, project]); setFuture((items) => items.slice(1)); setProject(next); setResult(null); setStatus("Wiederhergestellt."); };
 
-  // Werkzeugwege berechnen (entprellt)
+  const copyGcode = async () => {
+    if (!result) return;
+    try { await navigator.clipboard.writeText(result.gcode); setStatus("G-Code kopiert."); }
+    catch { setError("Der Browser hat den Zugriff auf die Zwischenablage blockiert. Markiere den G-Code im Textfeld und kopiere ihn dort."); }
+  };
   useEffect(() => {
-    if (!mesh) { setResult(null); return; }
-    setComputing(true);
-    const t = setTimeout(() => {
-      try {
-        setResult(computeToolpaths(mesh, settings));
-        setError(null);
-      } catch (e) {
-        setError(e instanceof Error ? e.message : 'Berechnung fehlgeschlagen.');
-        setResult(null);
-      } finally {
-        setComputing(false);
-      }
-    }, 250);
-    return () => clearTimeout(t);
-  }, [mesh, settings]);
+    const keydown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { setError(null); setStatus("Modus beendet."); }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") { event.preventDefault(); event.shiftKey ? redo() : undo(); }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "y") { event.preventDefault(); redo(); }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c" && result && !window.getSelection()?.toString()) { event.preventDefault(); void copyGcode(); }
+    };
+    window.addEventListener("keydown", keydown); return () => window.removeEventListener("keydown", keydown);
+  });
 
-  const gcode = useMemo(() => {
-    if (!result?.passes.length || !mesh) return '';
-    return generateGcode(result, settings, mesh.name);
-  }, [result, settings, mesh]);
-
-  const download = () => {
-    if (!gcode || !mesh) return;
-    const blob = new Blob([gcode], { type: 'text/plain' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = mesh.name.replace(/\.[^.]+$/, '') + '.gcode';
-    a.click();
-    URL.revokeObjectURL(a.href);
+  const openFile = async (file: File) => {
+    setLoading(true); setError(null); setStatus("Modell wird lokal geprüft...");
+    try {
+      const loaded = await loadModel(file); const initial = orientMesh(loaded.mesh, "+Z"); const height = Math.abs(initial.bbox.min[2]);
+      setModel(loaded); setProject({ ...DEFAULT_PROJECT, sectionDepth: Math.min(Math.max(height * 0.02, 0.02), 0.5) });
+      setPast([]); setFuture([]); setResult(null); setStep(1); setStatus(`${loaded.fileName} ist bereit. Jetzt die Oberseite wählen.`);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "Das Modell konnte nicht geöffnet werden."); setStatus("Import fehlgeschlagen."); }
+    finally { setLoading(false); }
   };
 
-  const modelSize = mesh
-    ? mesh.bbox.max.map((v, i) => ((v - mesh.bbox.min[i]) * settings.scale) / 100)
-    : null;
+  useEffect(() => {
+    const paste = (event: ClipboardEvent) => {
+      const file = Array.from(event.clipboardData?.files ?? [])[0];
+      if (file) { event.preventDefault(); void openFile(file); }
+    };
+    window.addEventListener("paste", paste);
+    return () => window.removeEventListener("paste", paste);
+  });
 
-  return (
-    <div
-      className="flex h-screen flex-col bg-zinc-50 text-zinc-900"
-      onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
-      onDragLeave={() => setDragOver(false)}
-      onDrop={(e) => {
-        e.preventDefault();
-        setDragOver(false);
-        const f = e.dataTransfer.files?.[0];
-        if (f) handleFile(f);
-      }}
-    >
-      {/* ---------- Kopfzeile ---------- */}
-      <header className="flex h-12 shrink-0 items-center justify-between border-b border-zinc-200 bg-white px-4">
-        <div className="flex items-center gap-2.5">
-          <svg width="20" height="20" viewBox="0 0 24 24" className="text-sky-600">
-            <path fill="currentColor" d="M12 2 L15 10 H9 Z" />
-            <path fill="currentColor" opacity="0.5" d="M11 10 h2 v6 l-1 6 -1 -6 Z" />
-          </svg>
-          <h1 className="text-sm font-semibold tracking-tight">Stichel CAM</h1>
-          <span className="text-xs text-zinc-400">3D → Gravur-G-Code für 3-Achs-Fräsen</span>
-        </div>
-        <div className="flex items-center gap-2">
-          {mesh && (
-            <span className="hidden text-xs text-zinc-400 md:block">
-              {mesh.name} · {mesh.triangleCount.toLocaleString('de-DE')} Dreiecke
-              {modelSize && ` · ${modelSize.map((v) => v.toFixed(1)).join(' × ')} mm`}
-            </span>
-          )}
-          <button
-            onClick={() => fileInputRef.current?.click()}
-            className="rounded-md border border-zinc-300 bg-white px-3 py-1.5 text-xs font-medium hover:bg-zinc-50"
-          >
-            {mesh ? 'Andere Datei…' : 'Datei öffnen…'}
-          </button>
-          <button
-            onClick={download}
-            disabled={!gcode}
-            className="rounded-md bg-sky-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-700 disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            G-Code herunterladen
-          </button>
-        </div>
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept={SUPPORTED_EXT.map((e) => '.' + e).join(',')}
-          className="hidden"
-          onChange={(e) => {
-            const f = e.target.files?.[0];
-            if (f) handleFile(f);
-            e.target.value = '';
-          }}
-        />
-      </header>
+  const toggleContour = (id: string) => {
+    const ignored = project.ignoredContourIds.includes(id) ? project.ignoredContourIds.filter((item) => item !== id) : [...project.ignoredContourIds, id];
+    patch({ ignoredContourIds: ignored }, ignored.includes(id) ? "Kontur wird ignoriert." : "Kontur wird bearbeitet.");
+  };
+  const calculate = (mode: MotionMode) => {
+    try {
+      const generated = generateToolpath({ contours, ignoredIds: project.ignoredContourIds, origin, tool: project.tool, mode, sequence: project.sequence, fileName: model?.fileName ?? "Modell" });
+      setProject({ ...project, motionMode: mode }); setResult(generated); setError(null); setStatus(`${mode === "2d" ? "2D" : "3D"}-Bewegung berechnet. ${generated.passes.length} Werkzeugwege sind bereit.`);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "Die Bewegung konnte nicht berechnet werden."); }
+  };
+  const download = () => {
+    if (!result) return; const url = URL.createObjectURL(new Blob([result.gcode], { type: "text/plain;charset=utf-8" }));
+    const anchor = document.createElement("a"); anchor.href = url; anchor.download = `${model?.fileName.replace(/\.[^.]+$/, "") ?? "stichel"}.gcode`; anchor.click(); URL.revokeObjectURL(url); setStatus("G-Code exportiert.");
+  };
+  const centerIs2D = step === 5 || (step === 6 && Boolean(result));
 
-      {error && (
-        <div className="border-b border-red-200 bg-red-50 px-4 py-2 text-xs text-red-700">
-          {error}
-          <button className="ml-3 underline" onClick={() => setError(null)}>schließen</button>
-        </div>
-      )}
-
-      <div className="flex min-h-0 flex-1">
-        {/* ---------- Einstellungen ---------- */}
-        <aside className="w-72 shrink-0 overflow-y-auto border-r border-zinc-200 bg-white">
-          <Section title="Schnittebene">
-            <SliderField
-              label="Höhe im Modell"
-              value={settings.slicePercent} min={0} max={100} step={1} unit=" %"
-              onChange={(v) => set('slicePercent', v)}
-            />
-            {mesh && (
-              <p className="text-[11px] leading-snug text-zinc-400">
-                Z = {(mesh.bbox.min[2] + ((mesh.bbox.max[2] - mesh.bbox.min[2]) * settings.slicePercent) / 100).toFixed(2)} mm.
-                Das Modell wird auf dieser Höhe geschnitten; die Konturen des Schnitts werden graviert.
-              </p>
-            )}
-            <NumberField label="Skalierung" value={settings.scale} min={1} step={1} unit="%" onChange={(v) => set('scale', v)} />
-          </Section>
-
-          <Section title="Strategie">
-            <Segmented
-              value={settings.strategy}
-              onChange={(v) => set('strategy', v)}
-              options={[
-                { value: 'contour', label: 'Kontur', hint: 'Umrisse der Schnittebene abfahren' },
-                { value: 'centerline', label: 'Mittellinie', hint: 'Mittellinien dünner Formen (Schrift/Zahlen) mit einem Strich gravieren' },
-                { value: 'fill', label: 'Füllung', hint: 'Flächen mit Schraffur ausräumen' },
-              ]}
-            />
-            {settings.strategy === 'centerline' && (
-              <p className="text-[11px] leading-snug text-zinc-400">
-                Ideal für Schriftzüge und Zahlen: Statt beider Umrisslinien wird nur die Strichmitte einmal graviert.
-              </p>
-            )}
-            {settings.strategy === 'fill' && (
-              <div className="space-y-2.5">
-                <NumberField label="Zeilenabstand (Stepover)" value={settings.stepOver} min={0.05} step={0.05} unit="mm" onChange={(v) => set('stepOver', v)} />
-                <NumberField label="Schraffurwinkel" value={settings.fillAngle} min={0} max={180} step={5} unit="°" onChange={(v) => set('fillAngle', v)} />
-              </div>
-            )}
-            <NumberField
-              label="Kurventoleranz" value={settings.tolerance} min={0.005} step={0.01} unit="mm"
-              hint="Maximale Abweichung beim Vereinfachen von Kurven – kleiner = genauer, mehr G-Code"
-              onChange={(v) => set('tolerance', v)}
-            />
-          </Section>
-
-          <Section title="Tiefe & Zustellung">
-            <div className="grid grid-cols-2 gap-2">
-              <NumberField label="Gravurtiefe" value={settings.totalDepth} min={0.01} step={0.1} unit="mm" onChange={(v) => set('totalDepth', v)} />
-              <NumberField label="Zustellung/Pass" value={settings.stepDown} min={0.01} step={0.05} unit="mm" onChange={(v) => set('stepDown', v)} />
-            </div>
-            <NumberField label="Sicherheitshöhe" value={settings.safeZ} min={0.5} step={0.5} unit="mm" onChange={(v) => set('safeZ', v)} />
-          </Section>
-
-          <Section title="Filter">
-            <NumberField
-              label="Konturen kürzer als … ignorieren" value={settings.minLength} min={0} step={0.1} unit="mm"
-              onChange={(v) => set('minLength', v)}
-            />
-            <Toggle
-              label="Äußerste Kontur ignorieren" checked={settings.ignoreOutermost}
-              hint="Plattenrand/Umriss nicht gravieren – nur innenliegende Details"
-              onChange={(v) => set('ignoreOutermost', v)}
-            />
-            <Toggle
-              label="Innenkonturen (Löcher) ignorieren" checked={settings.ignoreInner}
-              hint="Nur Außenumrisse gravieren"
-              onChange={(v) => set('ignoreInner', v)}
-            />
-            <NumberField
-              label="Max. Verschachtelungstiefe" value={settings.maxNestDepth} min={0} step={1}
-              hint="0 = nur äußerste Ebene, 99 = alle Ebenen"
-              onChange={(v) => set('maxNestDepth', Math.round(v))}
-            />
-          </Section>
-
-          <Section title="Nullpunkt">
-            <div className="flex items-start gap-3">
-              <OriginPicker value={settings.originXY} onChange={(v) => set('originXY', v)} />
-              <p className="text-[11px] leading-snug text-zinc-400">
-                XY-Nullpunkt am Werkstück (oben = hinten, unten = vorne).
-              </p>
-            </div>
-            <Segmented
-              value={settings.originZ}
-              onChange={(v) => set('originZ', v)}
-              options={[
-                { value: 'top', label: 'Z0 = Oberfläche' },
-                { value: 'bottom-of-cut', label: 'Z0 = Gravurgrund' },
-              ]}
-            />
-            <Toggle label="X spiegeln (Rückseitengravur)" checked={settings.mirrorX} onChange={(v) => set('mirrorX', v)} />
-          </Section>
-
-          <Section title="Maschine & Werkzeug" defaultOpen={false}>
-            <div className="grid grid-cols-2 gap-2">
-              <NumberField label="Vorschub XY" value={settings.feedXY} min={1} step={50} unit="mm/min" onChange={(v) => set('feedXY', v)} />
-              <NumberField label="Eintauchen Z" value={settings.feedZ} min={1} step={25} unit="mm/min" onChange={(v) => set('feedZ', v)} />
-            </div>
-            <div className="grid grid-cols-2 gap-2">
-              <NumberField label="Drehzahl" value={settings.spindleRpm} min={0} step={1000} unit="U/min" onChange={(v) => set('spindleRpm', v)} />
-              <NumberField label="Stichelspitze Ø" value={settings.toolDia} min={0.05} step={0.05} unit="mm" onChange={(v) => set('toolDia', v)} />
-            </div>
-            <Toggle label="Spindelbefehle (M3/M5) ausgeben" checked={settings.useSpindleCmd} onChange={(v) => set('useSpindleCmd', v)} />
-          </Section>
-
-          <div className="px-4 py-3">
-            <button
-              onClick={() => setSettings(defaultSettings)}
-              className="text-xs text-zinc-400 underline hover:text-zinc-600"
-            >
-              Einstellungen zurücksetzen
-            </button>
-          </div>
-        </aside>
-
-        {/* ---------- Hauptbereich ---------- */}
-        <main className="relative flex min-w-0 flex-1 flex-col">
-          <div className="flex h-10 shrink-0 items-center justify-between border-b border-zinc-200 bg-white px-3">
-            <div className="flex gap-1">
-              {([['3d', '3D-Modell'], ['2d', 'Werkzeugwege'], ['gcode', 'G-Code']] as [Tab, string][]).map(([t, label]) => (
-                <button
-                  key={t}
-                  onClick={() => setTab(t)}
-                  className={cn(
-                    'rounded-md px-3 py-1 text-xs font-medium',
-                    tab === t ? 'bg-zinc-100 text-zinc-900' : 'text-zinc-500 hover:text-zinc-800'
-                  )}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-            <div className="flex items-center gap-3 text-[11px] text-zinc-400">
-              {computing && <span className="text-sky-600">Berechne…</span>}
-              {result && result.passes.length > 0 && (
-                <>
-                  <span>{result.contours.length} Konturen</span>
-                  <span>Fräsweg {result.stats.cutLength.toFixed(0)} mm</span>
-                  <span>{result.stats.passCount} Zustellung(en)</span>
-                  <span>≈ {formatTime(result.stats.timeMin)}</span>
-                </>
-              )}
-            </div>
-          </div>
-
-          <div className="relative min-h-0 flex-1">
-            {!mesh && !loading && (
-              <button
-                onClick={() => fileInputRef.current?.click()}
-                className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-zinc-50"
-              >
-                <div className={cn(
-                  'flex flex-col items-center gap-3 rounded-2xl border-2 border-dashed px-16 py-14 transition-colors',
-                  dragOver ? 'border-sky-500 bg-sky-50' : 'border-zinc-300'
-                )}>
-                  <svg width="36" height="36" viewBox="0 0 24 24" fill="none" className="text-zinc-400">
-                    <path d="M12 3v12m0-12L8 7m4-4 4 4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-                  </svg>
-                  <div className="text-sm font-medium text-zinc-700">3D-Datei hierher ziehen oder klicken</div>
-                  <div className="text-xs text-zinc-400">STL · OBJ · 3MF · STEP · IGES · BREP</div>
-                </div>
-              </button>
-            )}
-            {loading && (
-              <div className="absolute inset-0 z-10 flex items-center justify-center bg-zinc-50/80 text-sm text-zinc-500">
-                Datei wird gelesen…
-              </div>
-            )}
-
-            <div className={cn('h-full', tab !== '3d' && 'hidden')}>
-              <Viewer3D mesh={mesh} slicePercent={settings.slicePercent} />
-            </div>
-            <div className={cn('h-full', tab !== '2d' && 'hidden')}>
-              <Preview2D result={result} />
-            </div>
-            {tab === 'gcode' && (
-              <div className="h-full overflow-auto bg-white p-4">
-                {gcode ? (
-                  <pre className="text-[11px] leading-relaxed text-zinc-600">{gcode}</pre>
-                ) : (
-                  <div className="flex h-full items-center justify-center text-sm text-zinc-400">
-                    Kein G-Code – erst Datei laden
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-        </main>
-      </div>
+  return <div className="app-shell">
+    <header className="topbar"><div className="brand"><span className="brand-mark">S</span><div><strong>STICHEL</strong><span>Geführter CAM-Entwurf</span></div></div>
+      <div className="history-actions"><button className="icon-button" onClick={undo} disabled={!past.length} aria-label="Rückgängig" title="Rückgängig (Strg Z)"><Undo2 /></button><button className="icon-button" onClick={redo} disabled={!future.length} aria-label="Wiederholen" title="Wiederholen (Strg Y)"><Redo2 /></button>{model && <div className="file-chip"><FileBox /><span>{model.fileName}</span><b>{model.triangleCount.toLocaleString("de-DE")} Dreiecke</b></div>}</div>
+    </header>
+    <div className="workspace">
+      <nav className="step-rail" aria-label="Arbeitsablauf"><div className="rail-title">Ablauf</div>{STEPS.map((label, index) => <button key={label} className={`step-item ${step === index ? "is-current" : ""} ${index < step ? "is-past" : ""}`} onClick={() => (index === 0 || model) && setStep(index)} disabled={index > 0 && !model} aria-current={step === index ? "step" : undefined}><span className="step-number">{index < step ? <Check /> : index + 1}</span><span>{label}</span></button>)}<div className="rail-help"><strong>Sicherheitsgrenze</strong><span>Diese Version erzeugt ausschließlich geschlossene Gravurkonturen. Keine Taschen, Bohrungen oder automatische Kollisionsprüfung.</span></div></nav>
+      <main className="stage-shell"><div className="stage-header"><div><span className="eyebrow">Schritt {step + 1} von 7</span><h1>{stageTitle(step)}</h1></div>{model && <button className="quiet-button" onClick={() => setShowTool((value) => !value)}>{showTool ? <EyeOff /> : <Eye />}{showTool ? "Werkzeug ausblenden" : "Werkzeug zeigen"}</button>}</div>
+        <div className="stage-body">{!model ? <div className="empty-stage"><FileUpload onFile={openFile} loading={loading} /><p>Keine Cloud, kein automatischer Werkzeugweg. Du entscheidest jeden Schritt.</p></div> : centerIs2D ? <ContourCanvas contours={contours} ignoredIds={project.ignoredContourIds} origin={origin} passes={result?.passes} interactive={step === 5} onToggle={toggleContour} /> : <ModelViewer mesh={oriented?.mesh ?? null} sectionZ={-sectionDepth} contours={contours} ignoredIds={project.ignoredContourIds} origin={origin} tool={project.tool} passes={result?.passes} showTool={showTool} />}</div>
+        <div className="stage-status" role="status"><span className={error ? "status-dot is-error" : "status-dot"} />{error ?? status}</div></main>
+      <aside className="inspector"><Inspector step={step} model={model} project={project} modelHeight={modelHeight} contours={contours} activeCount={activeContours.length} result={result} openFile={openFile} patch={patch} patchTool={patchTool} toggleContour={toggleContour} calculate={calculate} copy={copyGcode} download={download} /><div className="inspector-nav"><button className="secondary-button" onClick={() => setStep((value) => Math.max(0, value - 1))} disabled={step === 0}><ArrowLeft />Zurück</button>{step < 6 && <button className="primary-button" onClick={() => setStep((value) => Math.min(6, value + 1))} disabled={!model}>Weiter<ArrowRight /></button>}</div></aside>
     </div>
-  );
+  </div>;
 }
 
-function formatTime(min: number): string {
-  if (min < 1) return `${Math.round(min * 60)} s`;
-  if (min < 60) return `${min.toFixed(1)} min`;
-  return `${Math.floor(min / 60)} h ${Math.round(min % 60)} min`;
+interface InspectorProps { step: number; model: ModelInfo | null; project: ProjectState; modelHeight: number; contours: ReturnType<typeof extractContours>; activeCount: number; result: ToolpathResult | null; openFile: (file: File) => void; patch: (value: Partial<ProjectState>, message?: string) => void; patchTool: (key: keyof ProjectState["tool"], value: number) => void; toggleContour: (id: string) => void; calculate: (mode: MotionMode) => void; copy: () => void; download: () => void }
+
+function Inspector({ step, model, project, modelHeight, contours, activeCount, result, openFile, patch, patchTool, toggleContour, calculate, copy, download }: InspectorProps) {
+  if (step === 0) return <div className="inspector-content"><PanelHeading title="Modell öffnen" text="Die Datei bleibt auf diesem Gerät. Nach dem Import prüfst du zuerst die Ausrichtung." /><FileUpload onFile={openFile} loading={false} />{model && <Fact label="Geladen" value={model.fileName} />}</div>;
+  if (step === 1) return <div className="inspector-content"><PanelHeading title="Welche Seite zeigt nach oben?" text="Wähle die Achse, die zur Spindel zeigen soll." /><div className="orientation-grid">{ORIENTATIONS.map((item) => <button key={item.value} className={project.orientation === item.value ? "is-selected" : ""} onClick={() => patch({ orientation: item.value, ignoredContourIds: [] }, `${item.label} ist jetzt oben.`)}><b>{item.label}</b><span>{item.hint}</span></button>)}</div></div>;
+  if (step === 2) return <div className="inspector-content"><PanelHeading title="Schnittebene setzen" text="Die blaue Ebene bestimmt, welche Kanten erkannt werden. Schiebe sie knapp unter die gewünschte Gravur." /><label className="range-field"><span><b>Tiefe unter Oberseite</b><output>{project.sectionDepth.toFixed(2)} mm</output></span><input type="range" min="0.01" max={Math.max(0.02, modelHeight - 0.01)} step="0.01" value={Math.min(project.sectionDepth, Math.max(0.01, modelHeight - 0.01))} onChange={(event) => patch({ sectionDepth: Number(event.target.value), ignoredContourIds: [] }, "Schnittebene verschoben.")} /></label><div className="facts"><Fact label="Erkannte Konturen" value={String(contours.length)} /><Fact label="Modellhöhe" value={`${modelHeight.toFixed(2)} mm`} /></div>{!contours.length && <Notice>Auf dieser Ebene wurde keine geschlossene Kontur gefunden. Verschiebe die Ebene.</Notice>}</div>;
+  if (step === 3) return <div className="inspector-content"><PanelHeading title="Werkstück-Nullpunkt" text="Die Koordinaten im G-Code beziehen sich auf diesen Punkt. Setze denselben Punkt später an der Maschine." /><OriginPicker value={project.originPreset} onChange={(value) => patch({ originPreset: value }, "Nullpunkt gesetzt.")} /></div>;
+  if (step === 4) return <div className="inspector-content"><PanelHeading title="Stichel und Tiefe" text="Der Stichel wird maßstäblich in der Bühne angezeigt. Prüfe zuerst Tiefe und Sicherheitsabstand." /><div className="field-grid"><NumberField label="Spitzenbreite" value={project.tool.diameter} unit="mm" min={0.01} step={0.05} onChange={(value) => patchTool("diameter", value)} /><NumberField label="Spitzenwinkel" value={project.tool.angle} unit="°" min={10} step={5} onChange={(value) => patchTool("angle", value)} /><NumberField label="Gravurtiefe" value={project.tool.depth} unit="mm" min={0.01} step={0.05} onChange={(value) => patchTool("depth", value)} /><NumberField label="Zustellung" value={project.tool.stepDown} unit="mm" min={0.01} step={0.05} onChange={(value) => patchTool("stepDown", value)} /><NumberField label="Sicherheits-Z" value={project.tool.safeZ} unit="mm" min={0.1} step={0.5} onChange={(value) => patchTool("safeZ", value)} /><NumberField label="Vorschub" value={project.tool.feedRate} unit="mm/min" min={1} step={10} onChange={(value) => patchTool("feedRate", value)} /><NumberField label="Eintauchen" value={project.tool.plungeRate} unit="mm/min" min={1} step={10} onChange={(value) => patchTool("plungeRate", value)} /><NumberField label="Drehzahl" value={project.tool.spindleRpm} unit="U/min" min={1} step={500} onChange={(value) => patchTool("spindleRpm", value)} /></div></div>;
+  if (step === 5) return <div className="inspector-content"><PanelHeading title="Unwichtige Kanten ausblenden" text="Klicke die Würfelkante oder andere Konturen direkt in der Draufsicht an. Blau wird gefräst, Grau ignoriert." /><div className="contour-list">{contours.map((contour, index) => { const ignored = project.ignoredContourIds.includes(contour.id); return <button key={contour.id} onClick={() => toggleContour(contour.id)} className={ignored ? "is-ignored" : ""}><span>{index + 1}</span><div><b>{ignored ? "Ignorieren" : "Bearbeiten"}</b><small>{contour.perimeter.toFixed(1)} mm Umfang</small></div>{ignored ? <EyeOff /> : <Eye />}</button>; })}</div><Fact label="Aktiv" value={`${activeCount} von ${contours.length}`} /></div>;
+  return <div className="inspector-content"><PanelHeading title="Bewegung berechnen" text="Nichts wird automatisch berechnet. 2D fährt einmal auf Endtiefe, 3D teilt die Tiefe in sichere Zustellungen." /><div className="calculate-grid"><button onClick={() => calculate("2d")} className={project.motionMode === "2d" && result ? "is-selected" : ""}><b>2D-Bewegung</b><span>Eine konstante Gravurtiefe</span></button><button onClick={() => calculate("3d")} className={project.motionMode === "3d" && result ? "is-selected" : ""}><b>3D-Bewegung</b><span>Mehrere Tiefenstufen</span></button></div><SequenceEditor project={project} patch={patch} />{result && <><div className="result-summary"><Fact label="Werkzeugwege" value={String(result.passes.length)} /><Fact label="Schnittlänge" value={`${result.cutLength.toFixed(1)} mm`} /><Fact label="Schätzung" value={formatTime(result.estimatedSeconds)} /></div>{result.warnings.map((warning) => <Notice key={warning}>{warning}</Notice>)}<textarea className="gcode-output" value={result.gcode} readOnly aria-label="Generierter G-Code" /><div className="export-actions"><button className="secondary-button" onClick={copy}><Clipboard />Kopieren</button><button className="primary-button" onClick={download}><Download />Exportieren</button></div><span className="shortcut-hint">Strg C kopiert den G-Code, wenn kein Text markiert ist.</span></>}</div>;
 }
+
+function SequenceEditor({ project, patch }: { project: ProjectState; patch: (value: Partial<ProjectState>, message?: string) => void }) {
+  const labels: Record<SequencePreset, string> = { "safe-start": "Sicher starten", movement: "Berechnete Bewegung", pause: "Pause", "return-origin": "Zum Nullpunkt", "safe-end": "Sicher beenden" };
+  const add = (preset: SequencePreset) => { const end = project.sequence.findIndex((step) => step.preset === "safe-end"); const next = project.sequence.slice(); next.splice(end < 0 ? next.length : end, 0, { id: crypto.randomUUID(), preset, label: labels[preset] }); patch({ sequence: next }, "Schritt hinzugefügt."); };
+  const move = (index: number, direction: number) => { const next = project.sequence.slice(); const target = index + direction; if (target < 0 || target >= next.length) return; [next[index], next[target]] = [next[target], next[index]]; patch({ sequence: next }, "Reihenfolge geändert."); };
+  return <section className="sequence-editor"><div className="section-label"><span>Manuelle Schritte</span><small>Reihenfolge im G-Code</small></div>{project.sequence.map((item, index) => <div className="sequence-row" key={item.id}><span className="drag-index">{index + 1}</span><b>{item.label}</b><button onClick={() => move(index, -1)} disabled={index === 0} aria-label="Nach oben"><ChevronUp /></button><button onClick={() => move(index, 1)} disabled={index === project.sequence.length - 1} aria-label="Nach unten"><ChevronDown /></button><button onClick={() => patch({ sequence: project.sequence.filter((current) => current.id !== item.id) }, "Schritt entfernt.")} disabled={item.preset === "movement"} aria-label="Entfernen"><Trash2 /></button></div>)}<div className="preset-row"><span><Plus />Preset</span>{(["safe-start", "pause", "return-origin", "safe-end"] as SequencePreset[]).map((preset) => <button key={preset} onClick={() => add(preset)}>{labels[preset]}</button>)}</div></section>;
+}
+
+function OriginPicker({ value, onChange }: { value: OriginPreset; onChange: (value: OriginPreset) => void }) { const positions: OriginPreset[] = ["top-left", "center", "top-right", "bottom-left", "bottom-right"]; return <div className="origin-picker"><div className="origin-board">{positions.map((position) => <button key={position} className={`${position} ${value === position ? "is-selected" : ""}`} onClick={() => onChange(position)} aria-label={`Nullpunkt ${position}`}><span /></button>)}</div><p>Blauer Punkt = X0 / Y0 · Z0 liegt auf der Oberfläche.</p></div>; }
+function NumberField({ label, value, unit, min, step, onChange }: { label: string; value: number; unit: string; min: number; step: number; onChange: (value: number) => void }) { return <label className="number-field"><span>{label}</span><div><input type="number" value={value} min={min} step={step} onChange={(event) => onChange(Number(event.target.value))} /><b>{unit}</b></div></label>; }
+function PanelHeading({ title, text }: { title: string; text: string }) { return <div className="panel-heading"><h2>{title}</h2><p>{text}</p></div>; }
+function Fact({ label, value }: { label: string; value: string }) { return <div className="fact"><span>{label}</span><b>{value}</b></div>; }
+function Notice({ children }: { children: React.ReactNode }) { return <div className="notice">{children}</div>; }
+function formatTime(seconds: number) { const minutes = Math.floor(seconds / 60); const rest = Math.round(seconds % 60); return minutes ? `${minutes} min ${rest} s` : `${rest} s`; }
+function stageTitle(step: number) { return ["Ein gutes Ergebnis beginnt mit einer guten Datei.", "Lege fest, was oben ist.", "Zeige der Software die wichtigen Kanten.", "Lege X0, Y0 und Z0 bewusst fest.", "Prüfe den Stichel vor der Bewegung.", "Entferne alles, was nicht gefräst werden soll.", "Berechne erst, wenn alles stimmt."][step]; }
